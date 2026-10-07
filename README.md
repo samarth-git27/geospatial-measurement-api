@@ -9,7 +9,7 @@ The brief permits architectural decisions beyond the minimum. GeoMeasure uses th
 - **Automatic measurement CRS**: geographic input is transformed into an estimated UTM CRS when possible, with a metric fallback.
 - **Measurement provenance**: every measured feature records the CRS used for the calculation.
 - **Graceful unsupported geometry handling**: points and unsupported collections are returned with `measurement: null` and warnings instead of crashing the request.
-- **Secure ZIP ingestion**: member-count, expansion-size, and path-traversal protections are applied before extraction.
+- **Secure ZIP ingestion**: member-count, expansion-size, and path-traversal protections are applied before extractions.
 - **Resource limits**: upload size and feature count are configurable.
 - **API-first design**: OpenAPI documentation is generated automatically by FastAPI.
 - **Stateless processing boundary**: the current storage adapter is intentionally isolated so it can be replaced by Postgres/S3/Redis without changing the API contract.
