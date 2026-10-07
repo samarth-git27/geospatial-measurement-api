@@ -1,0 +1,1 @@
+Add fixture-based geospatial tests here as the project grows. Recommended fixtures include EPSG:4326 polygons, projected polygons, LineStrings, Points, invalid polygons, KML, and Shapefile ZIP archives.

@@ -1,0 +1,10 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MAX_UPLOAD_BYTES: 52428800
+      MAX_ARCHIVE_BYTES: 52428800
+      MAX_ARCHIVE_MEMBERS: 100
+      MAX_FEATURES: 100000
