@@ -1,186 +1,969 @@
-# GeoMeasure API
+# 🌍 GeoMeasure API
 
-A production-oriented FastAPI service that ingests KML files or ZIP archives containing ESRI Shapefiles, extracts feature metadata, and calculates metric measurements without performing area/length calculations directly on latitude/longitude degrees.
+### Geospatial files in. Accurate measurements out.
 
-## Why this implementation is different
+**GeoMeasure API** is a production-oriented geospatial processing service built with **FastAPI, GeoPandas, Shapely, and PyProj**.
 
-The brief permits architectural decisions beyond the minimum. GeoMeasure uses that freedom to make the API safer and more explicit:
+It accepts geospatial datasets such as **KML files** and **ZIP archives containing Shapefiles**, extracts their features, safely handles coordinate reference systems, and calculates physically meaningful measurements such as **polygon area** and **LineString length**.
 
-- **Automatic measurement CRS**: geographic input is transformed into an estimated UTM CRS when possible, with a metric fallback.
-- **Measurement provenance**: every measured feature records the CRS used for the calculation.
-- **Graceful unsupported geometry handling**: points and unsupported collections are returned with `measurement: null` and warnings instead of crashing the request.
-- **Secure ZIP ingestion**: member-count, expansion-size, and path-traversal protections are applied before extractions.
-- **Resource limits**: upload size and feature count are configurable.
-- **API-first design**: OpenAPI documentation is generated automatically by FastAPI.
-- **Stateless processing boundary**: the current storage adapter is intentionally isolated so it can be replaced by Postgres/S3/Redis without changing the API contract.
+The core idea is simple:
 
-## Requirements
+> **Never measure geographic coordinates as if degrees were meters.**
 
-Python 3.11+ or Docker.
+GeoMeasure automatically transforms geographic data into an appropriate projected coordinate system before calculating measurements.
 
-## Run locally
+---
 
-```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
+<p align="center">
+
+**UPLOAD → VALIDATE → PARSE → PROJECT → MEASURE → RESPOND**
+
+</p>
+
+---
+
+## ✨ Why GeoMeasure?
+
+Geospatial data looks deceptively simple.
+
+A polygon can be represented by a few coordinate pairs:
+
+```text
+(77.5946, 12.9716)
+(77.6046, 12.9716)
+(77.6046, 12.9816)
+(77.5946, 12.9816)
 ```
 
-Open `http://localhost:8000/docs` for Swagger UI.
+But those numbers may represent **longitude and latitude**, not meters.
 
-## Docker
+Calculating area directly from geographic coordinates can therefore produce meaningless results.
 
-```bash
-docker compose up --build
+GeoMeasure treats **CRS handling as a first-class part of measurement**, rather than an implementation detail.
+
+### Core principles
+
+| Principle | Implementation |
+|---|---|
+| 🛡️ Safe ingestion | Validates uploads and archive contents |
+| 🗺️ CRS-aware | Detects geographic CRS and projects before measurement |
+| 📐 Accurate measurements | Area in `m²`, length in `m` |
+| 🧩 Feature-centric | Every feature is processed independently |
+| 🚫 Graceful degradation | Unsupported geometries don't crash the pipeline |
+| 🔍 Observable | Structured status, metadata and warnings |
+| 🧪 Testable | Core processing and measurement logic covered by tests |
+| 🐳 Portable | Docker-ready development environment |
+
+---
+
+# 🏗️ Architecture
+
+```text
+                         ┌──────────────────────┐
+                         │      API Client      │
+                         │ curl / Postman / UI  │
+                         └──────────┬───────────┘
+                                    │
+                                    │ multipart/form-data
+                                    ▼
+                         ┌──────────────────────┐
+                         │      FastAPI         │
+                         │   API / Validation   │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │   Upload Validator   │
+                         │                      │
+                         │ • extension          │
+                         │ • size limits        │
+                         │ • archive safety     │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                    ┌──────────────────────────────┐
+                    │      Geospatial Reader       │
+                    │                              │
+                    │     KML       ZIP/Shapefile  │
+                    └──────────────┬───────────────┘
+                                   │
+                                   ▼
+                         ┌──────────────────────┐
+                         │     GeoDataFrame     │
+                         │                      │
+                         │ geometry + properties│
+                         │ CRS + feature index  │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │     CRS Engine       │
+                         │                      │
+                         │ Geographic CRS?      │
+                         │        │             │
+                         │        ▼             │
+                         │ Select projected CRS │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                    ┌─────────────────────────────┐
+                    │     Measurement Engine     │
+                    │                             │
+                    │ Polygon    → Area           │
+                    │ LineString → Length         │
+                    │ Point      → None           │
+                    │ Unsupported → Warning       │
+                    └──────────────┬──────────────┘
+                                   │
+                                   ▼
+                         ┌──────────────────────┐
+                         │   Measurement API    │
+                         │                      │
+                         │ metadata + results   │
+                         │ warnings + status    │
+                         └──────────────────────┘
 ```
 
-## API
+---
 
-### Health
+# 🔄 Processing Pipeline
 
-`GET /health`
+GeoMeasure processes every upload through a deterministic pipeline.
+
+```text
+              FILE
+               │
+               ▼
+        ┌─────────────┐
+        │   Validate  │
+        └──────┬──────┘
+               │
+               ▼
+        ┌─────────────┐
+        │    Parse    │
+        └──────┬──────┘
+               │
+               ▼
+        ┌─────────────┐
+        │ Extract CRS │
+        └──────┬──────┘
+               │
+               ▼
+       ┌─────────────────┐
+       │ Geographic CRS? │
+       └───────┬─────────┘
+               │
+        ┌──────┴──────┐
+        │             │
+       YES            NO
+        │             │
+        ▼             │
+ ┌──────────────┐     │
+ │ Project to   │     │
+ │ metric CRS   │     │
+ └──────┬───────┘     │
+        │             │
+        └──────┬──────┘
+               ▼
+       ┌──────────────┐
+       │   Measure    │
+       └──────┬───────┘
+              │
+              ▼
+       ┌──────────────┐
+       │  Normalize   │
+       │    Output    │
+       └──────┬───────┘
+              │
+              ▼
+            JSON
+```
+
+---
+
+# 📦 Supported Input
+
+GeoMeasure currently accepts:
+
+### KML
+
+```text
+survey.kml
+```
+
+### Shapefile archive
+
+```text
+survey.zip
+│
+├── survey.shp
+├── survey.shx
+├── survey.dbf
+└── survey.prj
+```
+
+The Shapefile components are expected to be supplied together inside the ZIP archive.
+
+---
+
+# 📐 Measurement Model
+
+GeoMeasure currently supports measurement for three major geometry categories.
+
+### Polygon
+
+```text
+Polygon
+   │
+   ▼
+Projected geometry
+   │
+   ▼
+Area
+   │
+   ▼
+square meters (m²)
+```
+
+### LineString
+
+```text
+LineString
+     │
+     ▼
+Projected geometry
+     │
+     ▼
+Length
+     │
+     ▼
+meters (m)
+```
+
+### Point
+
+Points are extracted normally, but no measurement is required.
+
+```text
+Point
+  │
+  ▼
+No measurement
+```
+
+Unsupported geometry types are handled gracefully rather than terminating the complete processing operation.
+
+---
+
+# 🧭 CRS Intelligence
+
+This is one of the most important parts of the project.
+
+Suppose the uploaded dataset uses:
+
+```text
+EPSG:4326
+```
+
+That CRS represents coordinates as:
+
+```text
+longitude / latitude
+```
+
+Those values are measured in **degrees**.
+
+GeoMeasure therefore does **not** perform:
+
+```python
+geometry.area
+```
+
+or:
+
+```python
+geometry.length
+```
+
+directly on the geographic geometry.
+
+Instead:
+
+```text
+EPSG:4326
+     │
+     │ geographic coordinates
+     ▼
+CRS selection
+     │
+     ▼
+Projected CRS
+     │
+     │ metric coordinates
+     ▼
+Measurement
+     │
+     ├── Area   → m²
+     └── Length → m
+```
+
+For geographic datasets, the service selects an appropriate projected coordinate system for measurement.
+
+This prevents the classic geospatial mistake of treating latitude/longitude degrees as physical distance.
+
+---
+
+# 🔌 API
+
+## `POST /api/files/`
+
+Uploads and processes a geospatial file.
+
+### Request
+
+```bash
+curl -X POST \
+  http://localhost:8000/api/files/ \
+  -F "file=@survey.kml"
+```
+
+Or:
+
+```bash
+curl -X POST \
+  http://localhost:8000/api/files/ \
+  -F "file=@survey.zip"
+```
+
+### Response
 
 ```json
-{"status":"ok"}
+{
+  "id": "abc123",
+  "filename": "survey.kml",
+  "feature_count": 120,
+  "crs": "EPSG:4326",
+  "status": "COMPLETED"
+}
 ```
 
-### Upload
+---
 
-`POST /api/files/`
+# 🔎 File Information
 
-Multipart field: `file`.
+## `GET /api/files/{id}/`
 
-Supported inputs:
-- `.kml`
-- `.zip` containing an ESRI Shapefile (`.shp`, with its companion files)
+Returns metadata about a processed file.
 
 Example:
 
 ```bash
-curl -X POST http://localhost:8000/api/files/ \\
-  -F "file=@survey.kml"
+curl \
+  http://localhost:8000/api/files/abc123/
 ```
 
-Response:
-
-```json
-{
-  "id": "...",
-  "filename": "survey.kml",
-  "file_type": "kml",
-  "feature_count": 120,
-  "crs": "EPSG:4326",
-  "measurement_crs": "EPSG:32643",
-  "status": "COMPLETED",
-  "warnings": []
-}
-```
-
-### File information
-
-`GET /api/files/{id}/`
-
-Returns the processing metadata and status.
-
-### Measurements
-
-`GET /api/files/{id}/measurements/`
-
-Each feature includes its ID, geometry type, geometry, source CRS, properties, measurement, measurement unit, calculation CRS, and warnings.
-
-Example feature shape:
-
-```json
-{
-  "id": 0,
-  "geometry_type": "Polygon",
-  "geometry": {"type": "Polygon", "coordinates": []},
-  "crs": "EPSG:4326",
-  "properties": {"name": "Parcel A"},
-  "measurement": 1842.31,
-  "measurement_unit": "square_meters",
-  "measurement_crs": "EPSG:32643",
-  "warnings": []
-}
-```
-
-## Architecture
+Possible information includes:
 
 ```text
-Client
-  |
-  v
-FastAPI route
-  |
-  +--> validation + resource limits
-  |
-  +--> secure ZIP extraction (if needed)
-  |
-  +--> GeoPandas / GDAL ingestion
-  |
-  +--> CRS analysis
-  |      |
-  |      +--> projected input: use source CRS
-  |      +--> geographic input: estimate UTM
-  |      +--> fallback: EPSG:3395
-  |
-  +--> feature normalization + measurements
-  |
-  +--> storage adapter
-  |
-  v
-JSON API
+File ID
+Filename
+Feature count
+Original CRS
+Processing status
+Warnings
 ```
 
-## CRS strategy
+---
 
-The brief explicitly requires that geographic coordinates not be measured directly in degrees. GeoMeasure therefore selects a projected metric CRS before calculating area or length. For geographic datasets, `estimate_utm_crs()` is preferred because UTM is generally appropriate for local/regional survey data. If that estimate cannot be produced, EPSG:3395 is used as a metric fallback. The selected CRS is exposed in the API so measurement provenance is visible.
+# 📊 Measurements
 
-For very large, cross-zone, polar, or geodesic workloads, a future version should support an explicit CRS strategy supplied by the caller.
+## `GET /api/files/{id}/measurements/`
 
-## Measurement rules
+Returns measurement information for the features contained in the uploaded dataset.
 
-- Polygon / MultiPolygon -> area in square meters.
-- LineString / LinearRing / MultiLineString -> length in meters.
-- Point -> no measurement required; returns `null`.
-- Unsupported/mixed geometry -> request remains successful; the feature contains a warning and `null` measurement.
+Example conceptual response:
 
-## Design decisions
+```json
+{
+  "file_id": "abc123",
+  "measurement_crs": "EPSG:32643",
+  "features": [
+    {
+      "feature_id": 0,
+      "geometry_type": "Polygon",
+      "measurement": {
+        "type": "area",
+        "value": 12051.54,
+        "unit": "m²"
+      }
+    },
+    {
+      "feature_id": 1,
+      "geometry_type": "LineString",
+      "measurement": {
+        "type": "length",
+        "value": 310.52,
+        "unit": "m"
+      }
+    },
+    {
+      "feature_id": 2,
+      "geometry_type": "Point",
+      "measurement": null
+    }
+  ]
+}
+```
 
-### FastAPI over Django
-The service is API-first, has a compact domain, and benefits from FastAPI's type-driven validation and generated OpenAPI contract.
+---
 
-### GeoPandas + GDAL
-This combination provides mature support for KML and Shapefile formats and interoperates directly with pyproj and Shapely.
+# ❤️ Health Check
 
-### In-memory repository
-The assignment focuses on ingestion and measurement rather than persistence. The repository is isolated behind `app/storage.py` so persistent storage can be introduced without rewriting the processing layer.
+## `GET /health`
 
-### Security-first ZIP handling
-Zip archives are an untrusted input boundary. The implementation checks archive size, expanded size, member count, and path traversal before extraction.
+Used to verify that the service is running.
 
-## Testing
+```bash
+curl http://localhost:8000/health
+```
+
+---
+
+# 🗂️ Project Structure
+
+```text
+geospatial-measurement-api/
+│
+├── app/
+│   ├── api/
+│   │   └── routes/
+│   │
+│   ├── core/
+│   │   ├── config.py
+│   │   └── ...
+│   │
+│   ├── services/
+│   │   ├── archive.py
+│   │   ├── geospatial.py
+│   │   ├── measurement.py
+│   │   └── ...
+│   │
+│   ├── models/
+│   ├── schemas/
+│   └── main.py
+│
+├── tests/
+│   ├── ...
+│   └── ...
+│
+├── Dockerfile
+├── docker-compose.yml
+├── pyproject.toml
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+The codebase separates:
+
+```text
+HTTP Layer
+    ↓
+Validation
+    ↓
+Geospatial Processing
+    ↓
+CRS Transformation
+    ↓
+Measurement
+    ↓
+Response Serialization
+```
+
+This keeps the API layer thin and makes the processing logic independently testable.
+
+---
+
+# 🛡️ Security & Defensive Processing
+
+Geospatial uploads are untrusted input.
+
+GeoMeasure therefore treats uploaded files as potentially hostile.
+
+### ZIP extraction protections
+
+The archive-processing layer is designed to defend against:
+
+- Path traversal
+- Malicious archive members
+- Excessive archive expansion
+- Oversized uploads
+- Unexpected archive contents
+- Excessive file counts
+
+Instead of blindly extracting:
+
+```text
+../../somewhere/file
+```
+
+the service validates the destination before extraction.
+
+### Why this matters
+
+A geospatial API is still an **upload-processing service**.
+
+That means security needs to be considered before geospatial correctness.
+
+---
+
+# 🧪 Testing
+
+The project includes automated tests covering the core behavior.
+
+Run:
 
 ```bash
 pytest
 ```
 
-The baseline suite covers health behavior, not-found semantics, and file-type validation. A production deployment should extend this with fixture-based KML/Shapefile tests, CRS accuracy tests, malformed archives, oversized inputs, invalid geometries, and property serialization edge cases.
+The test suite validates important processing paths including geospatial measurements and CRS-aware behavior.
 
-## Learning
+For development:
 
-This project demonstrates practical geospatial backend engineering: OGC-style geometry handling, GDAL-backed ingestion, CRS transformations, metric computation, API design, and secure file processing.
+```bash
+pytest -v
+```
 
-## Future scope
+---
 
-- PostgreSQL/PostGIS persistence.
-- Object storage for original uploads.
-- Background jobs for large datasets.
-- Pagination/streaming for very large feature collections.
-- Explicit measurement CRS selection by request.
-- Geodesic measurement mode for global-scale geometries.
-- GeoJSON download/export.
-- Authentication, rate limiting, audit logs, and observability.
-- Kubernetes deployment and horizontal workers.
+# 🐳 Run with Docker
+
+Build and start the service:
+
+```bash
+docker compose up --build
+```
+
+The API will be available at:
+
+```text
+http://localhost:8000
+```
+
+Interactive API documentation:
+
+```text
+http://localhost:8000/docs
+```
+
+Alternative OpenAPI documentation:
+
+```text
+http://localhost:8000/redoc
+```
+
+Stop the service:
+
+```bash
+docker compose down
+```
+
+---
+
+# 💻 Run Locally
+
+## 1. Clone
+
+```bash
+git clone https://github.com/samarth-git27/geospatial-measurement-api.git
+cd geospatial-measurement-api
+```
+
+## 2. Create a virtual environment
+
+### Windows
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+### Linux / macOS
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+## 3. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+## 4. Start the API
+
+```bash
+uvicorn app.main:app --reload
+```
+
+---
+
+# 📖 Interactive Documentation
+
+Once the API is running:
+
+### Swagger UI
+
+```text
+http://localhost:8000/docs
+```
+
+### ReDoc
+
+```text
+http://localhost:8000/redoc
+```
+
+Swagger makes it possible to upload and test geospatial files directly from the browser.
+
+---
+
+# 🧠 Design Decisions
+
+## Why FastAPI?
+
+FastAPI provides:
+
+- Strong request validation
+- Automatic OpenAPI generation
+- Excellent developer ergonomics
+- Async-ready architecture
+- Clear separation between API and processing layers
+
+For a service centered around file processing and API endpoints, it provides a lightweight foundation without unnecessary framework complexity.
+
+---
+
+## Why GeoPandas?
+
+GeoPandas provides a natural abstraction around:
+
+```text
+Geometry
++
+Attributes
++
+CRS
+```
+
+This makes it particularly suitable for feature-oriented geospatial processing.
+
+---
+
+## Why Shapely?
+
+Shapely provides the geometry operations required for:
+
+```text
+Polygon → area
+LineString → length
+```
+
+while allowing the application to remain independent of the API transport layer.
+
+---
+
+## Why PyProj?
+
+CRS transformation is delegated to **PyProj**, providing the coordinate-system machinery required to transform geographic data into projected coordinate systems before measurement.
+
+---
+
+# ⚙️ Error Handling Philosophy
+
+A single bad feature should not unnecessarily destroy an entire dataset.
+
+The processing pipeline therefore distinguishes between:
+
+```text
+Fatal file-level error
+        │
+        └── Cannot process dataset
+
+Feature-level issue
+        │
+        └── Record warning and continue
+```
+
+For example:
+
+```text
+Feature 0 → Polygon → measured
+Feature 1 → LineString → measured
+Feature 2 → Point → no measurement
+Feature 3 → Unsupported geometry → warning
+Feature 4 → Polygon → measured
+```
+
+This makes the API much more useful for real-world datasets containing mixed or imperfect geometry.
+
+---
+
+# 🚀 Performance Considerations
+
+The architecture is intentionally designed so processing can evolve independently from the HTTP layer.
+
+Potential future improvements include:
+
+```text
+Current
+   │
+   ├── Synchronous processing
+   │
+   ▼
+Future
+   │
+   ├── Background jobs
+   ├── Task queue
+   ├── Streaming uploads
+   ├── Persistent metadata store
+   ├── Object storage
+   ├── Distributed workers
+   └── Result caching
+```
+
+This allows the API to scale from a small engineering service into a larger geospatial processing platform.
+
+---
+
+# 🔮 Future Scope
+
+GeoMeasure is intentionally designed as a foundation rather than a dead-end assignment implementation.
+
+Potential extensions include:
+
+### More geometry measurements
+
+```text
+Polygon
+├── Area
+├── Perimeter
+└── Centroid
+
+LineString
+├── Length
+└── Segment statistics
+
+Point
+├── Coordinate extraction
+└── Spatial metadata
+```
+
+### More formats
+
+```text
+GeoJSON
+GeoPackage
+GeoTIFF metadata
+GPX
+CSV + coordinates
+```
+
+### Advanced geospatial operations
+
+```text
+Spatial indexing
+Bounding boxes
+Buffering
+Intersection
+Union
+Nearest-neighbor queries
+Spatial joins
+Topology validation
+```
+
+### Platform capabilities
+
+```text
+Async processing
+Job IDs
+Progress tracking
+Object storage
+Persistent database
+Authentication
+Rate limiting
+Observability
+Metrics
+Distributed workers
+```
+
+---
+
+# 🧩 Current vs Future Architecture
+
+```text
+                    ┌──────────────────┐
+                    │      Client      │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │     FastAPI      │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                  ┌──────────────────────┐
+                  │ Geospatial Processor │
+                  └──────────┬───────────┘
+                             │
+                ┌────────────┼────────────┐
+                ▼            ▼            ▼
+             Reader        CRS        Measurement
+                │            │            │
+                └────────────┼────────────┘
+                             ▼
+                         Response
+
+
+             ───────────── FUTURE ─────────────
+
+                    ┌──────────────────┐
+                    │      Client      │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │    API Gateway   │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │    Job Service   │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │    Task Queue    │
+                    └────────┬─────────┘
+                             │
+                  ┌──────────┼──────────┐
+                  ▼          ▼          ▼
+               Worker     Worker     Worker
+                  │          │          │
+                  └──────────┼──────────┘
+                             ▼
+                     Object Storage
+                             │
+                             ▼
+                        Result API
+```
+
+---
+
+# 📋 API Contract
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/health` | Service health |
+| `POST` | `/api/files/` | Upload and process file |
+| `GET` | `/api/files/{id}/` | Retrieve file information |
+| `GET` | `/api/files/{id}/measurements/` | Retrieve measurements |
+
+---
+
+# 🧭 Engineering Philosophy
+
+GeoMeasure follows a few principles:
+
+### 1. Correctness before convenience
+
+A measurement that looks plausible but is calculated in the wrong CRS is worse than an explicit error.
+
+### 2. Treat uploaded data as untrusted
+
+Every file enters through validation and defensive processing.
+
+### 3. Keep responsibilities isolated
+
+The API shouldn't know how polygon area is calculated.
+
+The measurement engine shouldn't know anything about HTTP.
+
+### 4. Fail gracefully
+
+A problematic feature should not automatically invalidate every valid feature around it.
+
+### 5. Design for evolution
+
+The initial implementation remains intentionally small, while the architecture leaves room for asynchronous processing, persistence, distributed workers, and additional geospatial operations.
+
+---
+
+# 📚 Learning & Takeaways
+
+This project explores the intersection of:
+
+- Backend API engineering
+- Geospatial data processing
+- Coordinate reference systems
+- Computational geometry
+- Secure file handling
+- Python service architecture
+- Automated testing
+- Containerized deployment
+
+The most important lesson is that **geospatial correctness is not simply a geometry problem — it is also a coordinate-system problem.**
+
+---
+
+# 🤝 Contributing
+
+Contributions are welcome.
+
+A typical development workflow:
+
+```bash
+git checkout -b feature/my-feature
+
+# make changes
+
+pytest
+
+git add .
+git commit -m "Add my feature"
+
+git push origin feature/my-feature
+```
+
+Then open a pull request.
+
+---
+
+# 📄 License
+
+Add the project's chosen open-source license here before publishing broadly.
+
+---
+
+# 👨‍💻 Author
+
+**Samarth**
+
+Graduate Engineer · Backend / AI / Systems Engineering
+
+GitHub:
+
+[github.com/samarth-git27](https://github.com/samarth-git27?utm_source=chatgpt.com)
+
+---
+
+<p align="center">
+
+### 🌍 GeoMeasure API
+
+**Turning raw geospatial files into trustworthy measurements.**
+
+</p>
